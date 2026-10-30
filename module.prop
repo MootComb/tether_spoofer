@@ -1,0 +1,8 @@
+id=tether_spoofer
+name=Tether Spoofer
+version=v1.0
+versionCode=1
+author=MootComb
+description=Makes your tethering invisible to your carrier.
+minMagisk=20400
+updateJson=https://raw.githubusercontent.com/MootComb/tether_spoofer/main/update.json
