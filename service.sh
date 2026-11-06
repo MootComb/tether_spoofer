@@ -8,7 +8,6 @@ log_msg() {
     [ "$LOG" = "true" ] && echo "$1" >> "$LOG_FILE"
 }
 
-# shellcheck disable=SC2034
 MODDIR=${0%/*}
 
 # 1. Disable tethering detection properties
@@ -34,7 +33,6 @@ HAS_IP=false
 log_msg "start $(date)"
 
 # 4. Candidate interfaces (broad list)
-# Includes upstream names (wlan0, ccmni*) — they will be filtered out below.
 IFACES="ap0 ap1 ap2 softap0 swlan0 rndis0 wlan0 wlan1 wlan2 wlan3 \
 rndis1 usb0 usb1 ncm0 ncm1 ncm2 ncm3 eth0 eth1 bt-pan bnep0 bnep1 ccmni-lan"
 
@@ -44,23 +42,19 @@ rndis1 usb0 usb1 ncm0 ncm1 ncm2 ncm3 eth0 eth1 bt-pan bnep0 bnep1 ccmni-lan"
 detect_upstream() {
     UL=""
 
-    # IPv4 default route
     U4=$(ip route get 8.8.8.8 2>/dev/null \
         | grep -o "dev [^ ]*" | cut -d' ' -f2 | head -n 1)
     [ -n "$U4" ] && UL="$UL $U4"
 
-    # IPv6 default route
     U6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null \
         | grep -o "dev [^ ]*" | cut -d' ' -f2 | head -n 1)
     [ -n "$U6" ] && UL="$UL $U6"
 
-    # All default routes across all tables (Android per-network tables)
     UALL=$(ip route show table all 2>/dev/null \
         | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' \
         | sort -u)
     for u in $UALL; do UL="$UL $u"; done
 
-    # Cellular interfaces that are UP (MediaTek/Qualcomm) — glob instead of ls|grep
     for path in /sys/class/net/ccmni* /sys/class/net/rmnet*; do
         [ -e "$path" ] || continue
         i=${path##*/}
@@ -70,7 +64,6 @@ detect_upstream() {
         esac
     done
 
-    # Deduplicate
     echo "$UL" | tr ' ' '\n' | sort -u | tr '\n' ' '
 }
 
@@ -78,7 +71,6 @@ if $HAS_IP; then
     UPSTREAM=$(detect_upstream)
     log_msg "upstream: $UPSTREAM"
 
-    # Retry once if nothing found (network may not be ready yet)
     if [ -z "$(echo "$UPSTREAM" | tr -d ' ')" ]; then
         sleep 30
         UPSTREAM=$(detect_upstream)
@@ -86,6 +78,19 @@ if $HAS_IP; then
     fi
 else
     UPSTREAM=""
+fi
+
+# ============================================================
+# 5.5. Extract primary IPv4/IPv6 upstream for NAT
+# ============================================================
+UP4=""
+UP6=""
+if $HAS_IP; then
+    UP4=$(ip route get 8.8.8.8 2>/dev/null \
+        | grep -o "dev [^ ]*" | cut -d' ' -f2 | head -n 1)
+    UP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null \
+        | grep -o "dev [^ ]*" | cut -d' ' -f2 | head -n 1)
+    log_msg "primary upstream: v4=$UP4 v6=$UP6"
 fi
 
 # ============================================================
@@ -103,7 +108,6 @@ for i in $IFACES; do
 done
 IFACES="${FILTERED# }"
 
-# If no upstream detected, restrict to confirmed-safe interfaces
 if [ -z "$(echo "$UPSTREAM" | tr -d ' ')" ]; then
     IFACES="ap0 rndis0"
     log_msg "no upstream — fallback IFACES: $IFACES"
@@ -112,7 +116,6 @@ log_msg "final IFACES: $IFACES"
 
 # ============================================================
 # 7. TTL/HL fix (masks hop count difference)
-#    Idempotent: check rule exists before adding.
 # ============================================================
 for IFACE in $IFACES; do
     if $HAS_IPTABLES; then
@@ -130,7 +133,6 @@ for IFACE in $IFACES; do
     fi
 done
 
-# Fallback if kernel lacks TTL/HL targets
 if $HAS_IPTABLES && ! iptables -j TTL -h >/dev/null 2>&1; then
     echo 64 > /proc/sys/net/ipv4/ip_default_ttl 2>/dev/null
     log_msg "fallback: ip_default_ttl=64"
@@ -141,10 +143,34 @@ if $HAS_IP6TABLES && ! ip6tables -j HL -h >/dev/null 2>&1; then
 fi
 
 # ============================================================
+# 7.5. NAT fix
+# ============================================================
+if $HAS_IPTABLES; then
+    if iptables -t nat -L tetherctrl_nat_POSTROUTING -n >/dev/null 2>&1; then
+        iptables -t nat -C POSTROUTING -j tetherctrl_nat_POSTROUTING 2>/dev/null \
+            || iptables -t nat -A POSTROUTING -j tetherctrl_nat_POSTROUTING 2>/dev/null
+        log_msg "nat: attached tetherctrl_nat_POSTROUTING"
+    fi
+
+    if [ -n "$UP4" ]; then
+        iptables -t nat -C POSTROUTING -o "$UP4" -j MASQUERADE 2>/dev/null \
+            || iptables -t nat -A POSTROUTING -o "$UP4" -j MASQUERADE 2>/dev/null
+        log_msg "nat: masquerade on $UP4"
+    fi
+fi
+
+if $HAS_IP6TABLES && [ -n "$UP6" ]; then
+    if ip6tables -t nat -L POSTROUTING -n >/dev/null 2>&1; then
+        ip6tables -t nat -C POSTROUTING -o "$UP6" -j MASQUERADE 2>/dev/null \
+            || ip6tables -t nat -A POSTROUTING -o "$UP6" -j MASQUERADE 2>/dev/null
+        log_msg "nat6: masquerade on $UP6"
+    fi
+fi
+
+# ============================================================
 # 8. Policy routing bypass (priority 5000), IPv4 + IPv6
 # ============================================================
 if $HAS_IP; then
-    # IPv4
     ROUTE4=$(ip route get 8.8.8.8 2>/dev/null)
     UP4=$(echo "$ROUTE4" | grep -o "dev [^ ]*" | cut -d' ' -f2 | head -n 1)
     T4=$(echo "$ROUTE4" | grep -o "table [^ ]*" | cut -d' ' -f2 | head -n 1)
@@ -162,7 +188,6 @@ if $HAS_IP; then
         done
     fi
 
-    # IPv6
     ROUTE6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null)
     UP6=$(echo "$ROUTE6" | grep -o "dev [^ ]*" | cut -d' ' -f2 | head -n 1)
     T6=$(echo "$ROUTE6" | grep -o "table [^ ]*" | cut -d' ' -f2 | head -n 1)
